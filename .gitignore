@@ -1,6 +1,13 @@
 # PROJECT SPECIFIC data/ folder
 data/
 notebooks/checkpoints
+notebooks/adv_checkpoints
+notebooks/wandb
+results/models
+/wandb
+*.err
+*.out
+*.pth
 
 # DEFAULTS
 # Byte-compiled / optimized / DLL files
