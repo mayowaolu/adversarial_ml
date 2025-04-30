@@ -4,6 +4,8 @@ notebooks/checkpoints
 notebooks/adv_checkpoints
 notebooks/wandb
 results/models
++results/logs/
++/checkpoints/
 /wandb
 *.err
 *.out
