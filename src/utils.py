@@ -7,11 +7,14 @@ def save_checkpoint(
     path: str,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler = None,
     epoch: int = None,
     metrics: dict = None,
     metric_key: str = None,
     top_checkpoints: list = None,
-    max_checkpoints: int = 5):
+    max_checkpoints: int = 5,
+    wandb_run_id = None
+    ):
     """
     Atomically save a training checkpoint.
 
@@ -19,6 +22,7 @@ def save_checkpoint(
       path      - full filepath to write (e.g. "checkpoints/last.ckpt" or ".../best_acc.ckpt")
       model     - your nn.Module
       optimizer - your optimizer
+      scheduler - (optional) your scheduler
       epoch     - (optional) current epoch number
       metrics   - (optional) dict of scalars (e.g. {"robust_acc":0.50, "clean_acc":0.84})
     """
@@ -28,10 +32,15 @@ def save_checkpoint(
         "optimizer_state":optimizer.state_dict(),
     }
 
+    if scheduler is not None:
+        state["scheduler"] = scheduler.state_dict()
     if epoch is not None:
         state["epoch"] = epoch
     if metrics:
         state["metrics"] = metrics
+    if wandb_run_id:
+        state["wandb_run_id"] = wandb_run_id
+    
     
 
     # 2) Write to a temp file then atomically rename
@@ -51,15 +60,25 @@ def save_checkpoint(
                 print(f"Removed checkpoint: {old_path}")
 
 def make_run_dir(base_dir="checkpoints", random_hex=True):
+    """
+    Creates a timestamped directory for a specific run
+
+    Args:
+        base_dir - Base checkpoint folder
+        random_hex - append a random 
+    """
+    
     # 1) timestamp
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 2) optional random hex so two runs in the same second don’t collide
     suffix=""
     if random_hex:
         suffix = f"_{secrets.token_hex(3)}"
+
     run_name = f"run_{stamp}{suffix}"
     run_dir = os.path.join(base_dir, run_name)
     os.makedirs(run_dir, exist_ok=False)
+
     return run_dir
 
 def get_model_norm(model):
