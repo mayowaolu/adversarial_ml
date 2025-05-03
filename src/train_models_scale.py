@@ -330,7 +330,7 @@ def main():
                 max_checkpoints=7
             )
 
-            wandb.save(f"{checkpoint_dir}/best_valAcc={current:.3f}.pth")
+            wandb.save(f"{checkpoint_dir}/best_valAcc={current:.3f}.pth", base_path=checkpoint_dir)
         
         if epoch % 5 == 0:
             save_checkpoint(
