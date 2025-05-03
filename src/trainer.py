@@ -19,7 +19,7 @@ from utils import save_checkpoint, make_run_dir, get_model_norm
 import wandb
 
 # -------------- TRAIN FUNCTION --------------------------------------
-def train(model, dataloader, metrics, optimizer, device, adv=True):
+def train(model, dataloader, metrics, optimizer, device, adv=True, epsilon=8/255, step_size=2/255, num_steps=10, lambda_reg=6.0, scaler=None):
     metrics.reset()
     model.train()
     start_evt, end_evt = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -38,7 +38,9 @@ def train(model, dataloader, metrics, optimizer, device, adv=True):
         model.train()
         # ---------------- mart loss and model optimization step --------------
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device, dtype=torch.float16):
+
+        use_amp = scaler is not None
+        with torch.autocast(device_type=device, dtype=torch.float16, enabled=use_amp):
             logits_clean = model(images)
 
             if adv:
@@ -50,16 +52,18 @@ def train(model, dataloader, metrics, optimizer, device, adv=True):
             else:
                 loss = F.cross_entropy(logits_clean, labels)
         
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        #optimizer.step()
+        if scaler:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         metrics["train/loss"].update(loss.detach())
-        if adv:
-            metrics["train/acc"].update(logits_adv.argmax(dim=1), labels)
-        else:
-            metrics["train/acc"].update(logits_clean.argmax(dim=1), labels)
+        logits_for_acc = logits_adv if adv else logits_clean
+        metrics["train/acc"].update(logits_for_acc.argmax(dim=1), labels)
+
     
     end_evt.record(); end_evt.synchronize()
     epoch_time = start_evt.elapsed_time(end_evt) / 1e3
