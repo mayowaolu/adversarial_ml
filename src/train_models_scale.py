@@ -1,7 +1,7 @@
-import os, time, argparse, random, yaml
+import os, argparse, random, yaml
 import torch
 import torch.optim as optim
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
@@ -16,6 +16,7 @@ from models.wide_resnet import WideResNet
 from mart_loss import mart_loss
 from utils import save_checkpoint, make_run_dir, get_model_norm
 from trainer import train, validate
+from data_utils import create_dataloaders
 
 import wandb
 
@@ -35,6 +36,7 @@ parser.add_argument('--config', default='./config_wrn.yml', help="Path to config
 parser.add_argument('--adversarial', action='store_true', help="Train adversarially (default: False). Pass this flag to enable.")
 parser.add_argument('--small', action='store_true', help="Train with tiny subset (default: False). Pass this flag to enable.")
 parser.add_argument('--compile', action='store_true', help="Use torch.compile (default: False). Pass this flag to enable.")
+parser.add_argument('--resume', default=None, help="Path to resume checkpoint")
 
 args = parser.parse_args()
 
@@ -42,6 +44,7 @@ args = parser.parse_args()
 adv = args.adversarial
 small_subset = args.small
 compile_flag = args.compile
+args.resume = args.resume
 
 try:
     cfg = yaml.safe_load(open(args.config))
@@ -69,9 +72,10 @@ data_path = cfg['data']['path']
 train_cfg = cfg["training"]
 batch_size = train_cfg["batch_size"]
 num_epochs = train_cfg["epochs"] if not small_subset else 10
+_optimizer = train_cfg['optimizer']['name']
 lr = train_cfg['optimizer']['params']["lr"]
-momentum = train_cfg['optimizer']['params']["momentum"]
 weight_decay = train_cfg['optimizer']['params']["weight_decay"]
+lr_scheduler = train_cfg['lr_scheduler']['name']
 
 # val cfg
 val_cfg = cfg["validation"]
@@ -104,65 +108,13 @@ os.makedirs(base_dir, exist_ok=True)
 os.makedirs(log_dir, exist_ok=True)
 
 
-
-#------------ DATALOADER -------------------
-try:
-    cpu_count = len(os.sched_getaffinity(0))
-except AttributeError:
-    cpu_count = 1
-
-def create_dataloaders(tiny=False):
-    # Create dataloaders
-    try:
-        train_transforms = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor()
-        ])
-
-        test_transforms = transforms.Compose([
-            transforms.ToTensor()
-        ])
-
-        # Attempt to load or download the datasets
-        train_cifar = datasets.CIFAR10(root=data_path, train=True, download=True, transform=train_transforms)
-        test_cifar = datasets.CIFAR10(root=data_path, train=False, download=True, transform=test_transforms)
-
-        if tiny:
-            rng  = torch.Generator().manual_seed(0)
-            train_idx = torch.randperm(len(train_cifar), generator=rng)[:5000]
-            test_idx  = torch.randperm(len(test_cifar),  generator=rng)[:500]
-            train_cifar = Subset(train_cifar, train_idx.tolist())
-            test_cifar  = Subset(test_cifar , test_idx.tolist())
-
-        # Create DataLoaders
-        train_loader = DataLoader(dataset=train_cifar, batch_size=batch_size, shuffle=True, num_workers=min(cpu_count, 10), pin_memory=True)
-        test_loader = DataLoader(dataset=test_cifar, batch_size=test_batch_size, shuffle=False, num_workers=min(cpu_count, 10), pin_memory=True)
-
-        print("Dataloaders created successfully")
-
-    except (OSError, RuntimeError, Exception) as e:
-        print(f"Error creating dataloaders: {e}")
-        print(f"Please check the data path '{data_path}', network connection, and dataset integrity.")
-        exit(1)
-    
-    return train_loader, test_loader
-
-
-
 def main():
-    wandb.login()
+    checkpoint_dir = None
+    wandb_run_id = None
 
-    wandb.init(
-         entity="johnolusetire-george-mason-university",
-         project="adversarial-ml-mart_main_resnet",
-         config = cfg
-    )
-
-    checkpoint_dir = make_run_dir(base_dir)
-    
     #---------------create dataloaders------------------------
-    train_loader, test_loader = create_dataloaders(small_subset)
+    print("Creating Dataloaders....")
+    train_loader, test_loader = create_dataloaders(data_path='./data', train_batch_size=256, tiny=small_subset)
     
     #--------------- create model, optimizer and scheduler--------
     if cfg["model"]["name"] == "ResNet":
@@ -174,11 +126,97 @@ def main():
 
     if compile_flag:
         model = torch.compile(model)
+        print("Using torch.compile")
+    
+    # optimizer
+    if _optimizer.lower() == "sgd":
+        momentum = train_cfg['optimizer']['params']["momentum"]
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    elif _optimizer.lower() == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unsupported optimizer: {optimizer}")
 
-    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-    scheduler = MultiStepLR(optimizer=optimizer, milestones= [75, 90, 100], gamma=0.1)
+    print(f"Using {_optimizer} as the optimizer.")
 
-    #-----------metrics--------------------------------------------
+    # scheduler
+    if lr_scheduler.lower() == "multisteplr":
+        milestones = train_cfg["lr_scheduler"]["params"]["milestones"]
+        gamma = train_cfg["lr_scheduler"]["params"]["gamma"]
+        scheduler = MultiStepLR(optimizer=optimizer, milestones=milestones, gamma=gamma)
+    elif lr_scheduler.lower() == "cosineannealinglr":
+        scheduler = CosineAnnealingLR(optimizer=optimizer, T_max=num_epochs, eta_min=0)
+    else:
+        raise ValueError(f"Unsupported learning rate scheduler: {lr_scheduler}")
+    
+    print(f"Using {lr_scheduler} as the learning rate scheduler.")
+
+    start_epoch = 1
+    best_val_acc = float("-inf")
+
+    # ------------------- Resume from checkpoint -------------------------------------
+    if args.resume is not None:
+        # Extract directory path from resume checkpoint
+        checkpoint_path = os.path.abspath(args.resume)
+        # Go up to find the checkpoint directory (typically 2 levels: /path/to/checkpoints/best/checkpoint.pth)
+        checkpoint_dir = os.path.dirname(os.path.dirname(checkpoint_path))
+
+        # Load the entire checkpoint dictionary, mapping tensors to the correct device
+        try:
+            checkpoint = torch.load(args.resume, map_location=device)
+            print(f"Loading checkpoint from: {args.resume}")
+
+            # checkpoint keys
+            # model_state, optimizer_state, scheduler, epoch, metrics
+
+            # Load Model State
+            if 'model_state' in checkpoint:
+                model.load_state_dict(checkpoint['model_state'])
+            else:
+                print("Warning: 'model_state' not found in checkpoint. Model weights not loaded.")
+
+            # Load Optimizer State
+            if 'optimizer_state' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state'])
+            else:
+                print("Warning: 'optimizer_state' not found in checkpoint. Optimizer state not loaded.")
+
+            # Load Scheduler State
+            if 'scheduler' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+            else:
+                print("Warning: 'scheduler' not found in checkpoint. Scheduler state not loaded.")
+
+            # Load Epoch
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch'] + 1 # Start from the next epoch
+            else:
+                print("Warning: 'epoch' not found in checkpoint. Starting from epoch 1.")
+                start_epoch = 1 # Default if epoch not found
+
+            # Load Best Validation Accuracy (Optional but recommended)
+            if 'metrics' in checkpoint and 'robust_acc' in checkpoint['metrics']: # Or clean_acc depending on goal
+                # Initialize best_val_acc from checkpoint if resuming
+                best_val_acc = checkpoint['metrics'].get('robust_acc', float("-inf")) if adv else checkpoint['metrics'].get('clean_acc', float("-inf"))
+                print(f"Resuming with best recorded accuracy: {best_val_acc:.4f}")
+            else:
+                print("Warning: Could not load previous best accuracy from checkpoint.")
+                best_val_acc = float("-inf") # Reset if not found
+            
+            if 'wandb_run_id' in checkpoint:
+                wandb_run_id = checkpoint['wandb_run_id']
+                print(f"Continuing wandb run: {wandb_run_id}")
+
+            print(f"Resuming training from epoch {start_epoch}")
+
+        except FileNotFoundError:
+            print(f"Error: Resume checkpoint file not found at {args.resume}")
+            exit(1)
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            exit(1)
+
+    # ----------- Metrics--------------------------------------------
     NUM_CLASSES = 10
 
     base_metrics = MetricCollection({
@@ -187,31 +225,52 @@ def main():
 
     train_metrics = base_metrics.clone(prefix="train/")   # ➜ keys: train/loss, train/acc
 
-    
     val_metrics   = MetricCollection({
-            "clean_acc" : Accuracy(task="multiclass", num_classes=NUM_CLASSES),
-            "adv_acc"   : Accuracy(task="multiclass", num_classes=NUM_CLASSES)}).to(device).clone(prefix="val/")
+        "clean_acc" : Accuracy(task="multiclass", num_classes=NUM_CLASSES),
+        "adv_acc"   : Accuracy(task="multiclass", num_classes=NUM_CLASSES)}, prefix="val/").to(device)
    
-
-
-    best_val_acc = float("-inf")
     top_checkpoints = []
 
-    if compile_flag:
+    if args.compile:
         for _ in range(3):
             dummy = torch.randn(1, 3, 32, 32, device=device)
             _ = model(dummy)
-   
-    
-    for epoch in range(1, num_epochs):
+
+    # ------------------ wandb logging -------------------
+    wandb.login()
+
+    wandb_init_args = {
+        "entity": "johnolusetire-george-mason-university",
+        "project": cfg["project"]["name"],
+        "config": cfg
+    }
+
+    if wandb_run_id:
+        wandb_init_args["id"] = wandb_run_id
+        wandb_init_args["resume"] = "must"
+
+    wandb.init(**wandb_init_args)
+    current_run_id = wandb.run.id  # Save the wandb run ID in checkpoints
+
+    if checkpoint_dir is None or not os.path.exists(checkpoint_dir):
+        checkpoint_dir = make_run_dir(base_dir)
+    else:
+        print(f"Resuming with existing checkpoint directory: {checkpoint_dir}")
+
+    print(f"Starting training for {num_epochs} epochs. Start epoch is {start_epoch}...")
+    for epoch in range(start_epoch, num_epochs):
 
         train_stats, elapsed = train(model=model,
                                 dataloader=train_loader,
                                 metrics=train_metrics,
                                 optimizer=optimizer,
                                 device=device,
-                                adv=adv)
-         
+                                adv=adv,
+                                epsilon=epsilon,
+                                step_size=step_size,
+                                num_steps=num_steps,
+                                lambda_reg=lambda_reg,
+                                scaler=scaler)
         
         val_stats = validate(model=model,
                             dataloader=test_loader,
@@ -228,7 +287,7 @@ def main():
         epoch_log = {
             "epoch": epoch,
             "lr": current_lr,
-            "elapsed": elapsed,
+            "time_elapsed": elapsed,
             "grad_norm": get_model_norm(model),
             **train_stats,
             **val_stats }
@@ -243,34 +302,42 @@ def main():
                 f"Val Adv Acc:  {val_stats['val/adv_acc']*100:.2f}% | "
                 f"Time: {elapsed:.2f}s")
         
-
-
         robust_acc, clean_acc = val_stats['val/adv_acc'], val_stats['val/clean_acc']
 
         # ------------- checkpoint -------------------
         # Save last checkpoint for easy training resumption
+
         save_checkpoint(
             path = f"{checkpoint_dir}/last/last.pth",
-            model=model, optimizer=optimizer,
+            model=model, optimizer=optimizer, scheduler=scheduler, # Add scheduler
             epoch=epoch,
-            metrics={"robust_acc": robust_acc, "clean_acc": clean_acc}
+            wandb_run_id=current_run_id,
+            metrics={"robust_acc": robust_acc.item(), "clean_acc": clean_acc.item()}
         )
 
         current = robust_acc if adv else clean_acc
         # Save top 10 models
         if current > best_val_acc:
-            best_val_acc = current
+            best_val_acc = current.item()
+            best_check_path = f"{checkpoint_dir}/best/best_valAcc={best_val_acc:.3f}.pth"
             save_checkpoint(
-                path = f"{checkpoint_dir}/best_valAcc={robust_acc:.3f}.pth",
+                path = best_check_path,
                 top_checkpoints=top_checkpoints,
-                model=model, optimizer=optimizer,
+                model=model, optimizer=optimizer, scheduler=scheduler, # Add scheduler
                 epoch=epoch,
-                metric_key="robust_acc",
-                metrics={"robust_acc": robust_acc, "clean_acc": clean_acc},
+                metric_key="robust_acc" if adv else "clean_acc",
+                metrics={"robust_acc": robust_acc.item(), "clean_acc": clean_acc.item()},
                 max_checkpoints=7
-                )
+            )
 
             wandb.save(f"{checkpoint_dir}/best_valAcc={current:.3f}.pth")
+        
+        if epoch % 5 == 0:
+            save_checkpoint(
+                path = f"{checkpoint_dir}/gradual/epoch{epoch}.pth",
+                model=model, optimizer=optimizer, scheduler=scheduler, epoch=epoch,
+                metrics={"robust_acc": robust_acc.item(), "clean_acc": clean_acc.item()})
+
 
     
 
@@ -284,7 +351,19 @@ def main():
     #                                 step_size=val_step_size,
     #                                 device=device)
     
-    print(f"Final Test accuracy: {clean_acc*100:.2f}%, Robust Acc: {robust_acc*100:.2f}%")
+    best_model = torch.load(best_check_path)
+    model.load_state_dict(best_model["model_state"])
+    val_stats = validate(model=model,
+                        dataloader=test_loader,
+                        metrics=val_metrics,
+                        num_steps=val_num_steps,
+                        epsilon=epsilon,
+                        step_size=val_step_size,
+                        device=device)
+    robust_acc, clean_acc = val_stats['val/adv_acc'], val_stats['val/clean_acc']
+
+    print(f"Best Model Loaded at epoch {best_model['epoch']}")
+    print(f"Final Natural accuracy: {clean_acc*100:.2f}%, Robust Acc: {robust_acc*100:.2f}%")
     wandb.finish()
 
 
